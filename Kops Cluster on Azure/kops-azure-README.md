@@ -392,16 +392,6 @@ the cleanup script when finished.
 
 ---
 
-## 13. Quick reference (this environment)
-
-| Item | Value |
-|---|---|
-| Subscription | `de5b8038-1724-4678-9a44-c5d55ed7f54f` (Microsoft Azure Sponsorship) |
-| Resource group | `Docker-FBS-Training` (centralindia, **shared**) |
-| Your object id | `e0be7df5-7140-4e49-8cb3-e27c2684bb46` |
-| State store | `azureblob://<username>kopsstate/kops-state` |
-| Cluster name | `<username>-<YYYY-MM-DD-HH-MM>.k8s.local` |
-| kops version | 1.35.1 · Kubernetes v1.35.5 |
 
 ### Command cheat‑sheet (replace `alice` with your username)
 
