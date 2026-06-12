@@ -88,7 +88,7 @@ kubectl get pod --show-labels
 ```
 To add label to a running pod
 ```
-kubectl label pod <pod-name> cloudthat=k8s
+kubectl label pod <pod-name> fbs=k8s
 ```
 Check the labels again
 ```
