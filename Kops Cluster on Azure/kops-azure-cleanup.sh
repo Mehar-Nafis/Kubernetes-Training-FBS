@@ -100,10 +100,53 @@ ask_required() {
   printf -v "$_name" '%s' "$_input"
 }
 
+# Subscription picker: list the subscriptions this login can see and let the user
+# pick the one their cluster lives in (must match what they used at create time).
+# With one subscription it's selected automatically; the choice is made active so
+# the state-store lookup below targets the right place.
+ask_subscription() {
+  local _names=() _ids=() _defs=() _n _id _def _input i mark n
+  echo "  Fetching your Azure subscriptions..."
+  while IFS=$'\t' read -r _n _id _def; do
+    [ -z "$_id" ] && continue
+    _names+=("$_n"); _ids+=("$_id"); _defs+=("$_def")
+  done < <(az account list --query "[?state=='Enabled'].[name,id,isDefault]" -o tsv 2>/dev/null)
+
+  n=${#_ids[@]}
+  if [ "$n" -eq 0 ]; then
+    echo "  (couldn't list subscriptions — are you logged in? 'az login') Falling back to free text / auto-detect."
+    ask AZURE_SUBSCRIPTION_ID "Azure subscription ID (blank = auto-detect)"
+    return
+  fi
+  if [ "$n" -eq 1 ]; then
+    AZURE_SUBSCRIPTION_ID="${_ids[0]}"
+    echo "  Only one subscription — using: ${_names[0]} (${_ids[0]})"
+    az account set --subscription "$AZURE_SUBSCRIPTION_ID" 2>/dev/null || true
+    return
+  fi
+
+  echo "  You have $n subscriptions — pick the one your cluster is in (number), type an ID, or Enter to keep [${AZURE_SUBSCRIPTION_ID}]:"
+  for (( i=0; i<n; i++ )); do
+    mark=" "; [ "${_defs[$i]}" = "True" ] && mark="*"
+    printf "      %2d)%s %s  (%s)\n" "$((i+1))" "$mark" "${_names[$i]}" "${_ids[$i]}"
+  done
+  echo "      (* = your current default subscription)"
+  read -r -p "  Subscription [${AZURE_SUBSCRIPTION_ID}]: " _input || _input=""
+  if [ -z "$_input" ]; then
+    :
+  elif [[ "$_input" =~ ^[0-9]+$ ]] && [ "$_input" -ge 1 ] && [ "$_input" -le "$n" ]; then
+    AZURE_SUBSCRIPTION_ID="${_ids[$((_input-1))]}"
+  else
+    AZURE_SUBSCRIPTION_ID="$_input"
+  fi
+  [ -n "$AZURE_SUBSCRIPTION_ID" ] && az account set --subscription "$AZURE_SUBSCRIPTION_ID" 2>/dev/null || true
+}
+
 if [ "$INTERACTIVE" = "true" ] && [ -t 0 ]; then
   echo "Enter the cluster to tear down (press Enter to accept the [default]):"
   echo ""
   ask_required USERNAME     "Username whose cluster to delete (REQUIRED)"
+  ask_subscription                                 # list/select the subscription the cluster is in
   ask RG_NAME               "Resource group the cluster is in"
   ask DELETE_STORAGE_ACCOUNT "Also delete the kops state-store storage account? (true/false)"
   echo ""
@@ -246,6 +289,13 @@ if [ -z "$TARGETS" ]; then
 else
   echo ">>> Found $(echo "$TARGETS" | grep -c .) resource(s) belonging to your cluster:"
   echo "$TARGETS" | sed 's|.*/||; s/^/      - /'
+  # Capture THIS cluster's managed-identity principal IDs BEFORE deleting the
+  # scale sets (deleting them destroys the identities, so we can't read the IDs
+  # afterwards). Step 5 uses these to remove ONLY this cluster's role
+  # assignment(s) — never another student's live identity.
+  CLUSTER_PRINCIPALS=$(echo "$TARGETS" | grep -i "virtualMachineScaleSets" | while IFS= read -r id; do
+    [ -n "$id" ] && az resource show --ids "$id" --query "identity.principalId" -o tsv 2>/dev/null
+  done | grep -v '^$' | sort -u)
   # Delete VM scale sets first so their instances/NICs/OS disks/identities are
   # released, which then lets the dependent networking resources delete cleanly.
   echo "$TARGETS" | grep -i "virtualMachineScaleSets" | while IFS= read -r id; do
@@ -270,22 +320,38 @@ else
   done
 fi
 
-# ── STEP 5: remove the cluster's now-dangling role assignment ─────────────
-# kops.sh gave your cluster's managed identity a role assignment on the RG.
-# Deleting the VM scale set above removes that identity, leaving the assignment
-# dangling (its principal no longer exists → principalName is null/empty).
-# We remove ONLY such dangling assignments. They reference principals that are
-# already gone, so this is harmless and never affects another user's live access.
-step "Removing dangling kops role assignment(s)"
-ORPHAN_RAS=$(az role assignment list --scope "$RG_SCOPE" \
-  --query "[?principalType=='ServicePrincipal' && (principalName==null || principalName=='')].id" \
-  -o tsv 2>/dev/null || true)
-if [ -n "$ORPHAN_RAS" ]; then
-  echo ">>> Removing $(echo "$ORPHAN_RAS" | grep -c .) dangling role assignment(s)..."
-  echo "$ORPHAN_RAS" | xargs -r -n1 -I{} az role assignment delete --ids {} >/dev/null 2>&1 \
-    && echo "   ✅ removed" || echo "   (some could not be removed — check manually)"
+# ── STEP 5: remove THIS cluster's role assignment(s) ──────────────────────
+# kops gave this cluster's managed identity a role assignment on the shared RG.
+# We remove ONLY the assignments whose principalId matches the identities we
+# captured in step 4 (this cluster's own scale sets). Matching by exact
+# principalId needs NO Graph/directory lookup, so it can never touch another
+# student's identity.
+#
+# DO NOT revert this to "delete every assignment whose principalName is
+# null/empty". Non-admin callers can't resolve service-principal names via the
+# Graph API, so principalName comes back null for EVERY live identity — that old
+# logic deleted other students' live cluster roles and silently broke their
+# clusters on the next stop/start (etcd-manager could no longer find its disks).
+step "Removing this cluster's role assignment(s)"
+if [ -n "${CLUSTER_PRINCIPALS:-}" ]; then
+  removed=0
+  for pid in $CLUSTER_PRINCIPALS; do
+    RAS=$(az role assignment list --scope "$RG_SCOPE" \
+      --query "[?principalId=='$pid'].id" -o tsv 2>/dev/null || true)
+    [ -z "$RAS" ] && continue
+    echo "$RAS" | xargs -r -n1 -I{} az role assignment delete --ids {} >/dev/null 2>&1 \
+      && removed=$((removed + $(echo "$RAS" | grep -c .)))
+  done
+  if [ "$removed" -gt 0 ]; then
+    echo "   ✅ removed $removed role assignment(s) belonging to this cluster's identity."
+  else
+    echo ">>> No role assignments found for this cluster's identity."
+  fi
 else
-  echo ">>> No dangling role assignments."
+  echo ">>> Could not determine this cluster's identity (scale sets already deleted?)."
+  echo "    Skipping role-assignment cleanup to avoid touching other clusters."
+  echo "    If a dangling assignment truly remains, delete it by its exact principalId:"
+  echo "      az role assignment list --scope \"$RG_SCOPE\" --query \"[?principalId=='<id>'].id\" -o tsv"
 fi
 
 # ── STEP 6: delete the state store & tidy ~/.bashrc ───────────────────────

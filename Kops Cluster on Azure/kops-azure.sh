@@ -78,6 +78,10 @@ NODE_VOLUME_SIZE="${NODE_VOLUME_SIZE:-50}"              # worker disk size in GB
 CONTAINER_NAME="${CONTAINER_NAME:-kops-state}"
 # SSH key for the cluster nodes (auto-generated if it doesn't exist).
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_rsa}"
+# Persistent copy of the SSH key is saved here so the SAME key is reused on
+# future runs and survives a fresh/ephemeral shell — you NEED this private key
+# to SSH into the cluster nodes later (e.g. to debug etcd/apiserver).
+SSH_KEY_BACKUP_DIR="${SSH_KEY_BACKUP_DIR:-$HOME/Downloads}"
 # Roll back any resources created if the script fails (true / false).
 KOPS_CLEANUP_ON_FAILURE="${KOPS_CLEANUP_ON_FAILURE:-true}"
 # Tag/label key used to stamp ownership on the Azure resources and the k8s nodes.
@@ -119,12 +123,91 @@ ask_required() {
   printf -v "$_name" '%s' "$_input"
 }
 
+# Region picker: query Azure for the live list of regions, show a numbered menu,
+# and let the user pick by NUMBER, type any region name, or press Enter to keep
+# the current value. Picking a different region than your classmates spreads load
+# across separate per-region cores quotas (handy when one region is full).
+ask_region() {
+  local REGION_OPTIONS=() _input i=1 r
+  echo "  Fetching available Azure regions..."
+  # Prefer zone-capable physical regions (the cluster needs a zonal region, as we
+  # derive the availability zone as <region>-1). Fall back gracefully if the
+  # zone field or the query isn't available.
+  mapfile -t REGION_OPTIONS < <(az account list-locations \
+      --query "[?metadata.regionType=='Physical' && availabilityZoneMappings != null].name" \
+      -o tsv 2>/dev/null | sort)
+  if [ "${#REGION_OPTIONS[@]}" -eq 0 ]; then
+    mapfile -t REGION_OPTIONS < <(az account list-locations \
+        --query "[?metadata.regionType=='Physical'].name" -o tsv 2>/dev/null | sort)
+  fi
+  if [ "${#REGION_OPTIONS[@]}" -eq 0 ]; then
+    echo "  (couldn't list regions — are you logged in? 'az login') Falling back to free text."
+    ask AZURE_LOCATION "Azure region"
+    return
+  fi
+
+  echo "  Azure region — pick a number, type any region name, or Enter to keep [${AZURE_LOCATION}]:"
+  for r in "${REGION_OPTIONS[@]}"; do printf "      %2d) %s\n" "$i" "$r"; i=$((i+1)); done
+  read -r -p "  Region [${AZURE_LOCATION}]: " _input || _input=""
+  if [ -z "$_input" ]; then
+    :                                   # keep current default
+  elif [[ "$_input" =~ ^[0-9]+$ ]] && [ "$_input" -ge 1 ] && [ "$_input" -le "${#REGION_OPTIONS[@]}" ]; then
+    AZURE_LOCATION="${REGION_OPTIONS[$((_input-1))]}"   # chose a menu number
+  else
+    AZURE_LOCATION="$_input"             # typed a region name directly
+  fi
+}
+
+# Subscription picker: list the subscriptions this login can see and let the user
+# pick by NUMBER, type a subscription ID, or press Enter to keep the current one.
+# With only one subscription it's selected automatically (no prompt). The chosen
+# subscription is made active so the region list below reflects it.
+ask_subscription() {
+  local _names=() _ids=() _defs=() _input i mark n
+  echo "  Fetching your Azure subscriptions..."
+  # One line per sub: name<TAB>id<TAB>isDefault (multiselect list keeps column order).
+  while IFS=$'\t' read -r _n _id _def; do
+    [ -z "$_id" ] && continue
+    _names+=("$_n"); _ids+=("$_id"); _defs+=("$_def")
+  done < <(az account list --query "[?state=='Enabled'].[name,id,isDefault]" -o tsv 2>/dev/null)
+
+  n=${#_ids[@]}
+  if [ "$n" -eq 0 ]; then
+    echo "  (couldn't list subscriptions — are you logged in? 'az login') Falling back to free text / auto-detect."
+    ask AZURE_SUBSCRIPTION_ID "Azure subscription ID (blank = auto-detect)"
+    return
+  fi
+  if [ "$n" -eq 1 ]; then
+    AZURE_SUBSCRIPTION_ID="${_ids[0]}"
+    echo "  Only one subscription — using: ${_names[0]} (${_ids[0]})"
+    az account set --subscription "$AZURE_SUBSCRIPTION_ID" 2>/dev/null || true
+    return
+  fi
+
+  echo "  You have $n subscriptions — pick a number, type a subscription ID, or Enter to keep [${AZURE_SUBSCRIPTION_ID}]:"
+  for (( i=0; i<n; i++ )); do
+    mark=" "; [ "${_defs[$i]}" = "True" ] && mark="*"
+    printf "      %2d)%s %s  (%s)\n" "$((i+1))" "$mark" "${_names[$i]}" "${_ids[$i]}"
+  done
+  echo "      (* = your current default subscription)"
+  read -r -p "  Subscription [${AZURE_SUBSCRIPTION_ID}]: " _input || _input=""
+  if [ -z "$_input" ]; then
+    :                                   # keep current value
+  elif [[ "$_input" =~ ^[0-9]+$ ]] && [ "$_input" -ge 1 ] && [ "$_input" -le "$n" ]; then
+    AZURE_SUBSCRIPTION_ID="${_ids[$((_input-1))]}"     # chose a menu number
+  else
+    AZURE_SUBSCRIPTION_ID="$_input"      # typed a subscription ID directly
+  fi
+  # Make the chosen subscription active so ask_region (and later steps) use it.
+  [ -n "$AZURE_SUBSCRIPTION_ID" ] && az account set --subscription "$AZURE_SUBSCRIPTION_ID" 2>/dev/null || true
+}
+
 if [ "$INTERACTIVE" = "true" ] && [ -t 0 ]; then
   echo "Enter your settings (press Enter to accept the [default]):"
   echo ""
   ask_required USERNAME     "Your name (REQUIRED — names the cluster + storage account)"
-  ask AZURE_SUBSCRIPTION_ID "Azure subscription ID (blank = auto-detect)"
-  ask AZURE_LOCATION        "Azure region"
+  ask_subscription                                 # list/select the Azure subscription
+  ask_region                                       # pick/enter the Azure region
   ask RG_NAME               "Existing resource group to deploy into"
   ask KOPS_AZ               "Availability zone (blank = <region>-1)"
   ask CONTROL_PLANE_COUNT   "Number of control-plane VMs"
@@ -279,12 +362,48 @@ echo ">>> All tools ready."
 # SSH KEY
 # ──────────────────────────────────────────────────────────────
 step "Preparing SSH key"
+mkdir -p "$(dirname "$SSH_KEY")" "$SSH_KEY_BACKUP_DIR"
+key_name="$(basename "$SSH_KEY")"
+# 1. If there's no key here but we saved one to Downloads on a previous run,
+#    restore and reuse it — this is what lets you SSH in after a fresh shell.
+if [ ! -f "$SSH_KEY" ] && [ -f "$SSH_KEY_BACKUP_DIR/$key_name" ]; then
+  echo ">>> Reusing SSH key previously saved in $SSH_KEY_BACKUP_DIR ..."
+  cp "$SSH_KEY_BACKUP_DIR/$key_name" "$SSH_KEY"
+  if [ -f "$SSH_KEY_BACKUP_DIR/$key_name.pub" ]; then
+    cp "$SSH_KEY_BACKUP_DIR/$key_name.pub" "$SSH_KEY.pub"
+  else
+    ssh-keygen -y -f "$SSH_KEY" > "$SSH_KEY.pub"
+  fi
+  chmod 600 "$SSH_KEY"; chmod 644 "$SSH_KEY.pub"
+fi
+# 2. Still no key anywhere → generate a fresh pair.
 if [ ! -f "$SSH_KEY" ]; then
   echo ">>> Generating SSH key pair at $SSH_KEY..."
-  mkdir -p "$(dirname "$SSH_KEY")"
   ssh-keygen -t rsa -b 4096 -N "" -f "$SSH_KEY"
 else
   echo ">>> SSH key already exists at $SSH_KEY"
+fi
+# 3. Get the PRIVATE key onto YOUR LAPTOP so you can SSH into the nodes later
+#    and reuse it next time. You MUST keep it — it cannot be recovered if lost.
+if command -v download >/dev/null 2>&1; then
+  # Azure Cloud Shell: $HOME is remote and ephemeral (it disappears when the
+  # sandbox recycles — this is exactly how earlier keys got lost). Cloud Shell's
+  # built-in 'download' streams the file to your laptop's browser Downloads.
+  echo ">>> Azure Cloud Shell detected — downloading your SSH key to your laptop's browser Downloads..."
+  download "$SSH_KEY"     || echo "   (auto-download failed — run manually:  download $SSH_KEY )"
+  download "$SSH_KEY.pub" || true
+  echo ">>> '$key_name' downloaded to your laptop. SSH in with:"
+  echo "      ssh -i ~/Downloads/$key_name kops@<node-ip>"
+  echo "    To REUSE it on a future run: upload it back into Cloud Shell first"
+  echo "    (top menu ⋯ → Upload, or drag the file in) so it lands at $SSH_KEY, then re-run."
+else
+  # Running on a real local machine (laptop/WSL): just copy it into Downloads.
+  mkdir -p "$SSH_KEY_BACKUP_DIR"
+  cp "$SSH_KEY" "$SSH_KEY_BACKUP_DIR/$key_name" 2>/dev/null \
+    && cp "$SSH_KEY.pub" "$SSH_KEY_BACKUP_DIR/$key_name.pub" 2>/dev/null \
+    && chmod 600 "$SSH_KEY_BACKUP_DIR/$key_name" 2>/dev/null \
+    && echo ">>> Saved a copy of your SSH key to $SSH_KEY_BACKUP_DIR/ (keep it safe; SSH in with: ssh -i $SSH_KEY_BACKUP_DIR/$key_name kops@<node-ip>)." \
+    || echo ">>> WARNING: could not copy SSH key to $SSH_KEY_BACKUP_DIR (continuing)."
 fi
 
 # ──────────────────────────────────────────────────────────────

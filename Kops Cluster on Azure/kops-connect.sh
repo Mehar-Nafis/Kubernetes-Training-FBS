@@ -51,10 +51,34 @@ export KOPS_STATE_STORE="azureblob://${SA_NAME}/${CONTAINER_NAME}"
 echo ">>> State store: $KOPS_STATE_STORE"
 
 # ---- Find your cluster (no need to remember the timestamped name) ----------
-CLUSTERS=$(kops get clusters 2>/dev/null | awk 'NR>1 && $1!="" {print $1}')
+# Capture BOTH stdout and stderr and the exit code, so a failure here is
+# explained instead of silently aborting the script (set -euo pipefail would
+# otherwise kill us right after the line above, before we refresh credentials —
+# which is the #1 reason this script "does nothing" and kubectl still says 401).
+echo ">>> Looking up your cluster..."
+if ! KOPS_OUT=$(kops get clusters 2>&1); then
+  if echo "$KOPS_OUT" | grep -qi "no clusters found"; then
+    echo "No clusters found in your state store ($KOPS_STATE_STORE)." >&2
+    echo "Either it was deleted, or the username doesn't match the one you" >&2
+    echo "created it with (you entered: $KOPS_USER)." >&2
+    exit 1
+  fi
+  echo "" >&2
+  echo "ERROR: kops could not read your state store:" >&2
+  echo "    $KOPS_STATE_STORE" >&2
+  echo "$KOPS_OUT" | sed 's/^/    /' >&2
+  echo "" >&2
+  echo "Most common cause: your Azure login/token expired (kops can't reach the" >&2
+  echo "state-store blob). Fix it with:" >&2
+  echo "    az login" >&2
+  echo "then re-run:  KOPS_USER=$KOPS_USER ./kops-connect.sh" >&2
+  exit 1
+fi
+CLUSTERS=$(echo "$KOPS_OUT" | awk 'NR>1 && $1!="" {print $1}')
 if [ -z "$CLUSTERS" ]; then
-  echo "No clusters found in your state store. Either it was deleted, or the" >&2
-  echo "username doesn't match the one you created it with." >&2
+  echo "No clusters found in your state store ($KOPS_STATE_STORE)." >&2
+  echo "Either it was deleted, or the username doesn't match the one you" >&2
+  echo "created it with (you entered: $KOPS_USER)." >&2
   exit 1
 fi
 
@@ -72,8 +96,23 @@ fi
 echo ">>> Using cluster: $CLUSTER"
 
 # ---- Refresh credentials & set kubectl context -----------------------------
-kops export kubecfg --admin="$ADMIN_TTL" --name="$CLUSTER"
-echo ">>> kubectl context set. Verifying..."
-kubectl get nodes
-echo ""
-echo "✅ Connected to $CLUSTER (credential valid for $ADMIN_TTL)."
+# This is the step that actually fixes a 401 ("server has asked for client to
+# provide credentials") — it writes a fresh admin cert into your kubeconfig.
+echo ">>> Refreshing admin credentials..."
+if ! kops export kubecfg --admin="$ADMIN_TTL" --name="$CLUSTER"; then
+  echo "" >&2
+  echo "ERROR: failed to export admin kubeconfig for $CLUSTER." >&2
+  echo "If this looks like an auth error, run 'az login' and retry." >&2
+  exit 1
+fi
+echo ">>> kubectl context set. Verifying API access..."
+if kubectl get nodes --request-timeout=20s; then
+  echo ""
+  echo "✅ Connected to $CLUSTER (credential valid for $ADMIN_TTL)."
+else
+  echo ""
+  echo "⚠️  Credentials were refreshed, but the API didn't answer yet." >&2
+  echo "    • If you JUST started the cluster, wait 1-2 min then: kubectl get nodes" >&2
+  echo "    • If it stays unreachable, the control plane may still be coming up." >&2
+  echo "    (This is no longer a credential problem — the kubeconfig is now valid.)" >&2
+fi

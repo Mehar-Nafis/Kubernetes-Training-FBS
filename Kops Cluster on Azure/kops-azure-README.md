@@ -136,8 +136,8 @@ three ways, in order of convenience:
 | Variable | Default | Notes |
 |---|---|---|
 | `USERNAME` | *(none — **required**)* | **You must set this.** Names the cluster + storage account. The script keeps re‑prompting until you enter it (interactive), or aborts if it's empty (non‑interactive/env). |
-| `AZURE_SUBSCRIPTION_ID` | *(empty)* | Empty = auto‑detected from `az login`. |
-| `AZURE_LOCATION` | `centralindia` | Azure region. |
+| `AZURE_SUBSCRIPTION_ID` | *(auto)* | Interactively the script **lists your subscriptions** and lets you pick one by number (or type an ID). With a single subscription it's selected automatically; the choice is made active so the region list reflects it. Setting the env var skips the prompt. |
+| `AZURE_LOCATION` | `centralindia` | Azure region. Interactively the script shows a **numbered region menu** — pick a number, type any region name, or Enter to keep the default. Choosing a different region uses that region's **separate cores quota** (useful when one region is full). |
 | `RG_NAME` | `Docker-FBS-Training` | **Existing** resource group to deploy into. |
 | `KOPS_AZ` | *(empty)* | Empty = derived as `<region>-1`. |
 | `CONTROL_PLANE_COUNT` / `_SIZE` / `_VOLUME_SIZE` | `1` / `Standard_D2s_v3` / `50` | Control‑plane sizing. |
@@ -324,8 +324,10 @@ chmod +x kops-azure-cleanup.sh
 ```
 
 It **prompts you for the username** whose cluster to tear down (required — it
-scopes the whole teardown), plus the resource group and whether to delete the
-state store. Then (6 steps): validates login → lists your cluster in the state
+scopes the whole teardown), then **lists your subscriptions so you can select the
+one the cluster is in** (auto‑selected if you only have one — must match what you
+used at create time), plus the resource group and whether to delete the state
+store. Then (6 steps): validates login → lists your cluster in the state
 store (read-only, just to show you) → **asks you to type `yes`** → **deletes only
 the resources whose name/tag matches that username** (`<username>…k8s.local`):
 VM scale sets first, then networking, with retries for dependencies → removes the
@@ -384,6 +386,7 @@ the cleanup script when finished.
 | `USERNAME=alice ./script` seems to use the wrong name | `USERNAME` is a **reserved** shell variable (your OS login) and can't be overridden | Use **`KOPS_USER`** instead: `KOPS_USER=alice ./script`. |
 | A node stuck `NotReady` after scaling down | The removed worker's VM is gone but its node object lingers | Usually self‑clears; force it with `kubectl delete node <name>`. |
 | After `./kops-start.sh`, `kubectl` can't reach the API | API endpoint/creds need refreshing | Wait ~3–5 min, then `KOPS_USER=<you> ./kops-connect.sh`. |
+| `OperationNotAllowed … exceeding approved Total Regional Cores quota` (create or scale‑up) | The region's shared vCPU quota is full (whole class is in one region) | Free cores: have idle students `./kops-stop.sh` (deallocated VMs don't count against quota) or `./kops-azure-cleanup.sh`; **create in a different region** (the region picker — each region has its own quota); or ask an Owner to raise the quota (link is in the error). Check usage: `az vm list-usage -l centralindia -o table \| grep -i vcpu`. |
 
 ### Decoding node names
 `control-plane-centralindia-1000000` = `<scale-set>` + `<instance index>`:
@@ -392,6 +395,16 @@ the cleanup script when finished.
 
 ---
 
+## 13. Quick reference (this environment)
+
+| Item | Value |
+|---|---|
+| Subscription | `de5b8038-1724-4678-9a44-c5d55ed7f54f` (Microsoft Azure Sponsorship) — the shared default; create & cleanup let you **pick a different one** if you have multiple. The other scripts read `AZURE_SUBSCRIPTION_ID` (create persists it to `~/.bashrc`); on a brand‑new machine, pass it explicitly if you used a non‑default subscription. |
+| Resource group | `Docker-FBS-Training` (centralindia, **shared**) |
+| Your object id | `e0be7df5-7140-4e49-8cb3-e27c2684bb46` |
+| State store | `azureblob://<username>kopsstate/kops-state` |
+| Cluster name | `<username>-<YYYY-MM-DD-HH-MM>.k8s.local` |
+| kops version | 1.35.1 · Kubernetes v1.35.5 |
 
 ### Command cheat‑sheet (replace `alice` with your username)
 
